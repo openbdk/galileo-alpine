@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# ══════════════════════════════════════════════════════════════════════
+#  hume.check — Build M: empirical diagnostics for the build lines
+# ══════════════════════════════════════════════════════════════════════
+#
+#  "Matters of fact require observation, not assumption."
+#  Records what a Descartes or Chomsky build actually installed and
+#  proves the AION boundary by trying it, then diffs any two records
+#  (before/after an upgrade).
+#
+#  Usage:
+#    sudo bash hume.check snapshot [OUT.json]   observe and record
+#    bash hume.check diff A.json B.json         what changed between two
+#
+#  Records land in /var/lib/bankonme/hume/ by default.
+# ══════════════════════════════════════════════════════════════════════
+
+set -euo pipefail
+
+readonly HUME_DIR="/var/lib/bankonme/hume"
+readonly RPC_FILE="/etc/bankonme/aion-bitcoin.rpc"
+
+# probe METHOD → HTTP status for the aion user (200 read ok, 403 refused)
+probe() {
+    [[ -r "${RPC_FILE}" ]] || { echo "no-creds"; return; }
+    # shellcheck disable=SC1090
+    . "${RPC_FILE}"
+    curl -s -o /dev/null -w '%{http_code}' --max-time 5 -u "aion:${AION_BTC_RPC_PASS}" \
+        -d "{\"method\":\"$1\",\"params\":[]}" "${AION_BTC_RPC_URL}" || echo "down"
+}
+
+snapshot() {
+    local out="${1:-${HUME_DIR}/$(hostname)-$(date +%Y%m%dT%H%M%S).json}"
+    mkdir -p "$(dirname "${out}")"
+    python3 - "${out}" "$(probe getblockcount)" "$(probe getnewaddress)" "$(probe sendtoaddress)" "$(probe stop)" <<'PY'
+import hashlib, json, os, platform, shutil, subprocess, sys, time
+out, read, newaddr, send, stop = sys.argv[1:]
+
+def ver(tool):
+    path = shutil.which(tool)
+    if not path:
+        return None
+    try:
+        v = subprocess.run([tool, "--version"], capture_output=True, text=True, timeout=10).stdout.splitlines()[0]
+    except Exception as e:
+        v = f"error: {e}"
+    with open(path, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
+    return {"path": path, "version": v, "sha256": digest}
+
+def sha(path):
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+os_release = {}
+if os.path.exists("/etc/os-release"):
+    for line in open("/etc/os-release"):
+        if "=" in line:
+            k, v = line.rstrip().split("=", 1)
+            os_release[k] = v.strip('"')
+
+boundary = {"read:getblockcount": read, "write:getnewaddress": newaddr,
+            "write:sendtoaddress": send, "control:stop": stop}
+# The boundary holds only if the daemon answered and refused every non-read call.
+held = read == "200" and all(v == "403" for k, v in boundary.items() if not k.startswith("read"))
+
+record = {
+    "observed_at": int(time.time()),
+    "host": platform.node(), "arch": platform.machine(),
+    "os": f"{os_release.get('ID', '?')} {os_release.get('VERSION_ID', '?')}",
+    "tools": {t: ver(t) for t in ("bitcoind", "bitcoin-cli", "forge", "cast", "anvil", "chisel", "python3")},
+    "files": {p: sha(p) for p in ("/etc/bankonme/bitcoin.conf",
+                                  "/etc/init.d/bankon-bitcoind",
+                                  "/etc/systemd/system/bankon-bitcoind.service")},
+    "aion_boundary": boundary,
+    "aion_boundary_held": held if read not in ("down", "no-creds") else None,
+}
+with open(out, "w") as f:
+    json.dump(record, f, indent=2)
+print(out)
+for k, v in record["tools"].items():
+    print(f"  {k:12} {v['version'] if v else 'MISSING'}")
+print(f"  AION boundary: {boundary} -> "
+      f"{'HELD' if record['aion_boundary_held'] else 'NOT OBSERVED' if record['aion_boundary_held'] is None else 'BROKEN'}")
+PY
+}
+
+diff_records() {
+    python3 - "$1" "$2" <<'PY'
+import json, sys
+a, b = (json.load(open(p)) for p in sys.argv[1:3])
+def flat(d, pre=""):
+    for k, v in d.items():
+        if isinstance(v, dict):
+            yield from flat(v, f"{pre}{k}.")
+        else:
+            yield f"{pre}{k}", v
+fa, fb = dict(flat(a)), dict(flat(b))
+changed = 0
+for k in sorted(set(fa) | set(fb)):
+    if k == "observed_at" or fa.get(k) == fb.get(k):
+        continue
+    changed += 1
+    print(f"{k}\n  - {fa.get(k)}\n  + {fb.get(k)}")
+print(f"{changed} observed differences")
+PY
+}
+
+case "${1:-}" in
+    snapshot) snapshot "${2:-}" ;;
+    diff)     [[ $# -eq 3 ]] || { echo "usage: hume.check diff A.json B.json" >&2; exit 2; }; diff_records "$2" "$3" ;;
+    *)        sed -n '11,15p' "$0" | sed 's/^#  \{0,1\}//'; exit 2 ;;
+esac

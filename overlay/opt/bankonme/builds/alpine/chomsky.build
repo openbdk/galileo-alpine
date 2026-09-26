@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# ══════════════════════════════════════════════════════════════════════
+#  chomsky.build — bankonOS Alpine line (binary / production edition)
+# ══════════════════════════════════════════════════════════════════════
+#
+#  Point of departure: legacy/chomsky (v3, 2017) — the first bankonmeOS
+#  "production 64 bit environment": signed binaries, a firewall, no
+#  compiler on the box. This is that line carried onto Alpine (musl,
+#  OpenRC, doas) for OpenBDK.
+#
+#  Includes:
+#    Bitcoin Core  apk community package (musl, signed by Alpine) by
+#                  default; --source builds the pinned upstream release
+#    Foundry       forge / cast / anvil / chisel from the official
+#                  *_alpine_* (musl) release archives, sha256-pinned
+#
+#  Target: Alpine Linux 3.24 (x86_64 or aarch64). Needs bash:
+#    apk add bash   (or run openbdk/builder basher.sh first)
+#
+#  Usage:
+#    doas bash chomsky.build all [--source]   repos + deps + bitcoin + foundry + conf + service
+#    doas bash chomsky.build repos            enable main + community for ALPINE_BRANCH
+#    doas bash chomsky.build bitcoin [--source]
+#    doas bash chomsky.build foundry
+#    doas bash chomsky.build conf             bitcoin.conf + AION read-only RPC user
+#    doas bash chomsky.build service          OpenRC service bankon-bitcoind (not started)
+#    doas bash chomsky.build verify
+#    doas bash chomsky.build iso              hand off to galileo-alpine.install iso
+#
+#  Environment: BITCOIN_GPG_VERIFY=1, BITCOIN_PRUNE=N (see descartes.build)
+#  Log: /var/log/bankonme/builds.log
+# ══════════════════════════════════════════════════════════════════════
+
+set -euo pipefail
+
+readonly CODENAME="Chomsky"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "${SCRIPT_DIR}/../lib/common.sh"
+
+readonly BTC_USER="bitcoin"
+FROM_SOURCE=0
+
+preflight() {
+    need_root
+    [[ -f /etc/alpine-release ]] || fail "Chomsky targets Alpine; on Debian use builds/debian/descartes.build"
+    local have; have="v$(cut -d. -f1,2 /etc/alpine-release)"
+    [[ "${have}" == "${ALPINE_BRANCH}" ]] \
+        || warn "running Alpine ${have}; builds are pinned to ${ALPINE_BRANCH}"
+}
+
+do_repos() {
+    step "apk repositories (${ALPINE_BRANCH} main + community)"
+    local mirror="https://dl-cdn.alpinelinux.org/alpine"
+    cp -a /etc/apk/repositories "/etc/apk/repositories.bak.$(date +%s)"
+    cat > /etc/apk/repositories <<EOF
+${mirror}/${ALPINE_BRANCH}/main
+${mirror}/${ALPINE_BRANCH}/community
+EOF
+    apk update -q
+    success "repositories set"
+}
+
+do_deps() {
+    step "base packages"
+    apk add -q bash curl ca-certificates openssl git coreutils tar gnupg shadow
+    if [[ "${FROM_SOURCE}" == 1 ]]; then
+        apk add -q build-base cmake pkgconf python3 linux-headers \
+            libevent-dev boost-dev sqlite-dev zeromq-dev
+    fi
+    success "packages installed"
+}
+
+do_bitcoin() {
+    if [[ "${FROM_SOURCE}" == 1 ]]; then
+        bitcoin_build_source
+        return
+    fi
+    step "Bitcoin Core — Alpine community package"
+    apk add -q bitcoin bitcoin-cli
+    success "$(bitcoind -version | head -1) (apk)"
+    [[ "$(bitcoind -version | head -1)" == *"v${BITCOIN_VERSION}"* ]] \
+        || log "apk ships an older release than upstream ${BITCOIN_VERSION}; use --source to build it"
+}
+
+ensure_btc_user() {
+    id -u "${BTC_USER}" >/dev/null 2>&1 && return 0
+    addgroup -S "${BTC_USER}"
+    adduser -S -D -H -h "${BTC_DATADIR}" -s /sbin/nologin -G "${BTC_USER}" "${BTC_USER}"
+}
+
+do_conf() { ensure_btc_user; bitcoin_configure "${BTC_USER}"; }
+
+do_service() {
+    step "OpenRC service bankon-bitcoind"
+    ensure_btc_user
+    local bin; bin="$(command -v bitcoind)" || fail "bitcoind not installed"
+    mkdir -p /etc/init.d
+    cat > /etc/init.d/bankon-bitcoind <<EOF
+#!/sbin/openrc-run
+description="bankonOS Bitcoin Core daemon"
+command="${bin}"
+command_args="-conf=${BTC_CONF} -datadir=${BTC_DATADIR}"
+command_user="${BTC_USER}:${BTC_USER}"
+command_background=true
+pidfile="/run/\${RC_SVCNAME}.pid"
+retry="TERM/600/KILL/5"
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+    chmod 755 /etc/init.d/bankon-bitcoind
+    success "installed; start with: rc-update add bankon-bitcoind && rc-service bankon-bitcoind start"
+}
+
+usage() { sed -n '19,31p' "$0" | sed 's/^#  \{0,1\}//'; }
+
+main() {
+    local cmd="${1:-help}"; shift || true
+    [[ "${1:-}" == "--source" ]] && FROM_SOURCE=1
+    case "${cmd}" in
+        all)     preflight; do_repos; do_deps; do_bitcoin; install_foundry alpine; do_conf; do_service; verify_tools ;;
+        repos)   preflight; do_repos ;;
+        deps)    preflight; do_deps ;;
+        bitcoin) preflight; do_deps; do_bitcoin ;;
+        foundry) preflight; install_foundry alpine ;;
+        conf)    preflight; do_conf ;;
+        service) preflight; do_service ;;
+        verify)  verify_tools ;;
+        iso)     preflight; [[ -f "${SCRIPT_DIR}/../../galileo-alpine.install" ]] || fail "iso needs the full bankonOS repo (github.com/cryptoAGI/bankonOS)"
+                 exec bash "${SCRIPT_DIR}/../../galileo-alpine.install" iso "$@" ;;
+        help|-h|--help) usage ;;
+        *) usage; exit 2 ;;
+    esac
+}
+
+main "$@"

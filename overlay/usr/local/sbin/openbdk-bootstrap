@@ -1,0 +1,41 @@
+#!/bin/sh
+# openbdk-bootstrap [USER] — openBDK's basher.sh, done unattended at boot.
+#
+# basher.sh needs doas/sudo before it can install anything and ends by
+# exec'ing an interactive bash, so it cannot run from init. This does the
+# same work non-interactively on Galileo Alpine:
+#   - bash installed (already on the ISO) and set as USER's login shell
+#   - doas with a wheel rule, USER in wheel
+#   - the apk cache that openbdk.install expects at /etc/apk/bdkcache, put on
+#     the boot medium when it is writable (so it survives a diskless reboot)
+# Then openbdk/builder's openbdk.install can run as-is.
+set -eu
+USER_NAME="${1:-root}"
+say() { echo "[openbdk-bootstrap] $*"; }
+
+command -v bash >/dev/null || apk add -q bash
+if [ "$USER_NAME" != root ] && ! id "$USER_NAME" >/dev/null 2>&1; then
+    adduser -D -s /bin/bash "$USER_NAME"; say "created user $USER_NAME"
+fi
+usermod -s /bin/bash "$USER_NAME" && say "$USER_NAME login shell: bash"
+grep -qx /bin/bash /etc/shells || echo /bin/bash >> /etc/shells
+
+command -v doas >/dev/null || apk add -q doas
+[ "$USER_NAME" = root ] || addgroup "$USER_NAME" wheel 2>/dev/null || true
+say "doas: $(cat /etc/doas.d/galileo.conf 2>/dev/null | grep -v '^#' | head -1)"
+
+# apk cache: on the boot medium if writable, else in RAM
+cache=/etc/apk/bdkcache
+for m in /media/*; do
+    [ -d "$m/apks" ] || continue
+    if touch "$m/.bdk-w" 2>/dev/null; then
+        rm -f "$m/.bdk-w"; mkdir -p "$m/cache"
+        rm -rf "$cache"; ln -s "$m/cache" "$cache"
+        say "apk cache on the boot medium: $m/cache (survives reboots)"
+        break
+    fi
+done
+[ -e "$cache" ] || { mkdir -p "$cache"; say "apk cache in RAM: $cache (boot medium read-only)"; }
+chmod 755 "$cache"
+
+say "ready for openbdk/builder: bash openbdk.install (clone it with your credentials — the repo is private)"

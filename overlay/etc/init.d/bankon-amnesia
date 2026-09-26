@@ -1,0 +1,26 @@
+#!/sbin/openrc-run
+# bankon amnesia on Alpine (OpenRC): RAM only while up, wipe on the way down.
+# In diskless mode Alpine already keeps its root in RAM; this adds zram,
+# the RAM vault, no core dumps, and the wipe at shutdown.
+description="bankon amnesia — RAM only while up, wipe on the way down"
+
+depend() {
+    need localmount
+    before networking
+}
+
+start() {
+    ebegin "Starting bankon-amnesia"
+    /usr/local/sbin/bankon-amnesia start
+    eend $?
+}
+
+stop() {
+    ebegin "Wiping (bankon-amnesia)"
+    /usr/local/sbin/bankon-amnesia stop
+    eend $?
+}
+
+status() {
+    /usr/local/sbin/bankon-amnesia status
+}

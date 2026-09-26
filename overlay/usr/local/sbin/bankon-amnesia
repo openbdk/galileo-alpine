@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# bankon-amnesia — amnesia as a service (after the Heads example).
+#
+# start: keep the running system in RAM only
+#   - disk swap off; compressed swap in RAM (zram) instead
+#   - RAM vault: tmpfs at /run/bankon-vault, mode 700, owned by the user
+#   - no core dumps (they would write process memory to disk)
+#   - RAM-oriented sysctls (bankon-ram tune)
+# stop: forget
+#   - shred the RAM vault, reset zram, drop caches, sdmem if installed
+#     (bankon-ram wipe-ram). With init_on_free=1 on the kernel command line
+#     the kernel also zeroes every page as it is freed.
+# status: report which of the above hold right now.
+#
+# Settings: /etc/default/bankon-amnesia
+
+set -uo pipefail
+
+AMNESIA_USER=bankon
+AMNESIA_VAULT=/run/bankon-vault
+AMNESIA_VAULT_SIZE=256M
+AMNESIA_ZRAM_PERCENT=50
+AMNESIA_ZRAM_ALGO=zstd
+# shellcheck disable=SC1091
+[ -r /etc/default/bankon-amnesia ] && . /etc/default/bankon-amnesia
+export BANKON_RAM_VAULT="$AMNESIA_VAULT"
+
+RAM=/usr/local/bin/bankon-ram
+say() { echo "[bankon-amnesia] $*"; }
+
+start() {
+    local s
+    for s in $(awk 'NR > 1 && $1 !~ /zram/ { print $1 }' /proc/swaps); do
+        swapoff "$s" && say "disk swap off: $s"
+    done
+    if ! grep -q zram /proc/swaps; then
+        "$RAM" zram "$AMNESIA_ZRAM_PERCENT" "$AMNESIA_ZRAM_ALGO" >/dev/null && say "zram swap on"
+    fi
+    "$RAM" tune >/dev/null
+
+    if ! mountpoint -q "$AMNESIA_VAULT"; then
+        mkdir -p "$AMNESIA_VAULT"
+        local uid gid owner="$AMNESIA_USER"
+        if uid=$(id -u "$AMNESIA_USER" 2>/dev/null) && gid=$(id -g "$AMNESIA_USER" 2>/dev/null); then :; else
+            uid=0; gid=0; owner="root — user $AMNESIA_USER not found"
+        fi
+        mount -t tmpfs -o "size=$AMNESIA_VAULT_SIZE,mode=700,uid=$uid,gid=$gid,nosuid,nodev,noexec" tmpfs "$AMNESIA_VAULT" \
+            && say "RAM vault $AMNESIA_VAULT ($AMNESIA_VAULT_SIZE, owner $owner)"
+    fi
+
+    sysctl -q -w kernel.core_pattern='|/bin/false' fs.suid_dumpable=0 && say "core dumps off"
+}
+
+stop() {
+    say "wiping"
+    "$RAM" wipe-ram
+}
+
+status() {
+    local ok=0
+    chk() { if eval "$2"; then printf '  %-26s yes\n' "$1"; else printf '  %-26s NO\n' "$1"; ok=1; fi; }
+    chk "no disk swap"        "! awk 'NR > 1 && \$1 !~ /zram/' /proc/swaps | grep -q ."
+    chk "zram swap"           "grep -q zram /proc/swaps"
+    chk "RAM vault mounted"   "mountpoint -q '$AMNESIA_VAULT'"
+    chk "core dumps off"      "[ \"\$(sysctl -n kernel.core_pattern)\" = '|/bin/false' ]"
+    # toram (live-boot) or a tmpfs root (Alpine diskless) — both run from RAM
+    chk "running from RAM"    "grep -qw toram /proc/cmdline || awk '\$2 == \"/\" && \$3 == \"tmpfs\" { f = 1 } END { exit !f }' /proc/mounts"
+    chk "init_on_free=1"      "grep -qw init_on_free=1 /proc/cmdline"
+    if [ -f /etc/alpine-release ]; then
+        chk "Alpine diskless (tmpfs /)" "awk '\$2 == \"/\" && \$3 == \"tmpfs\" { f = 1 } END { exit !f }' /proc/mounts"
+        chk "no lbu persistence"        "! grep -qs '^LBU_MEDIA=' /etc/lbu/lbu.conf"
+    fi
+    return $ok
+}
+
+case "${1:-status}" in
+    start) start ;;
+    stop) stop ;;
+    restart) stop; start ;;
+    status) status ;;
+    *) echo "usage: bankon-amnesia {start|stop|restart|status}"; exit 2 ;;
+esac

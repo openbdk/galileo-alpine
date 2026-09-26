@@ -1,0 +1,6 @@
+# /etc/default/bankon-amnesia
+AMNESIA_USER=bankon
+AMNESIA_VAULT=/run/bankon-vault
+AMNESIA_VAULT_SIZE=256M
+AMNESIA_ZRAM_PERCENT=50
+AMNESIA_ZRAM_ALGO=zstd

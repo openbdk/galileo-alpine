@@ -1,0 +1,21 @@
+#!/sbin/openrc-run
+# Galileo Alpine — runs at every boot (diskless: every boot is the first).
+#   - bash as root's shell (what openBDK's basher.sh sets up, done here unattended)
+#   - with `openbdk=1` on the kernel command line: openbdk-bootstrap runs too
+description="Galileo Alpine first boot"
+
+depend() {
+    need localmount
+    after networking bankon-amnesia
+}
+
+start() {
+    ebegin "Galileo first boot"
+    command -v usermod >/dev/null && usermod -s /bin/bash root 2>/dev/null
+    if grep -qw 'openbdk=1' /proc/cmdline; then
+        /usr/local/sbin/openbdk-bootstrap root >/var/log/openbdk-bootstrap.log 2>&1 \
+            && einfo "openbdk-bootstrap done (/var/log/openbdk-bootstrap.log)" \
+            || ewarn "openbdk-bootstrap failed (/var/log/openbdk-bootstrap.log)"
+    fi
+    eend 0
+}

@@ -1,0 +1,12 @@
+
+  Galileo Alpine — bankonOS on Alpine, for openBDK
+  Running from RAM (diskless). Nothing is kept unless you `lbu commit`.
+
+    bankon-ram status        RAM, zram, tmpfs, what is using memory
+    bankon-ram net           network + Tor checks (sends nothing)
+    bankon-amnesia status    is this session amnesic?
+    openbdk-bootstrap USER   prepare for openbdk/builder (bash, doas, apk cache)
+    apk add bitcoin bitcoin-cli                               Bitcoin Core, offline from the ISO
+    bash /opt/bankonme/builds/alpine/chomsky.build conf       bitcoin.conf + read-only AION RPC user
+    bash /opt/bankonme/builds/alpine/chomsky.build foundry    Foundry (musl, needs network)
+
