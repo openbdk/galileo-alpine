@@ -7,7 +7,8 @@ VERSION="${1:?usage: build.sh VERSION (e.g. 0.1.0)}"
 ALPINE_BRANCH="${ALPINE_BRANCH:-v3.24}"
 APORTS_REF="${APORTS_REF:-de51ebac9230046e58032d397ee1f0a10a069627}"   # 3.24-stable, 2026-09-25
 here="$(cd "$(dirname "$0")" && pwd)"
-rt="$(command -v docker || command -v podman)"   # rootless podman cannot keep abuild-sudo setuid || { echo "podman or docker required" >&2; exit 1; }
+# podman preferred, docker as the fallback
+rt="$(command -v podman || command -v docker)" || { echo "podman or docker required" >&2; exit 1; }
 mkdir -p "${here}/dist"
 "$rt" run --rm \
     -v "${here}:/src" -v "${here}/dist:/out" -v galileo-alpine-work:/work \

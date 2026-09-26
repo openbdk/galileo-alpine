@@ -5,7 +5,14 @@ set -eu
 : "${VERSION:?}" "${ALPINE_BRANCH:?}" "${APORTS_REF:?}"
 cd /src
 
-apk add -q alpine-sdk alpine-conf syslinux xorriso squashfs-tools grub grub-efi mtools dosfstools git
+# Under rootless podman apk cannot keep abuild-sudo's setuid bit and reports an
+# error; abuild-sudo is not used here (mkimage runs as the build user), so accept
+# that and check the tools that are actually needed.
+apk add -q alpine-sdk alpine-conf syslinux xorriso squashfs-tools grub grub-efi mtools dosfstools git \
+    || echo "apk reported errors (rootless: abuild-sudo setuid) — checking the tools instead"
+for t in abuild-keygen fakeroot mksquashfs xorriso grub-mkimage mformat git; do
+    command -v "$t" >/dev/null || { echo "missing build tool: $t"; exit 1; }
+done
 # the mounted trees belong to the host user; let git read them for the manifest
 git config --global --add safe.directory "*"
 
