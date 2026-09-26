@@ -15,6 +15,8 @@ install -D -m 0644 "${src}/builds/versions.env"                         "${o}/op
 install -D -m 0644 "${src}/builds/lib/common.sh"                        "${o}/opt/bankonme/builds/lib/common.sh"
 install -D -m 0755 "${src}/builds/alpine/chomsky.build"                 "${o}/opt/bankonme/builds/alpine/chomsky.build"
 install -D -m 0755 "${src}/builds/hume.check"                           "${o}/opt/bankonme/builds/hume.check"
+install -D -m 0755 "${src}/builds/share/bankon-share"                   "${o}/usr/local/bin/bankon-share"
+install -D -m 0755 "${src}/builds/share/thotmap.py"                     "${o}/usr/local/bin/thotmap.py"
 
 {
     echo "# overlay files vendored from bankonOS (github.com/cryptoAGI/bankonOS)"

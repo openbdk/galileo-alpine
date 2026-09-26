@@ -61,6 +61,8 @@ tor
 torsocks
 cryptsetup
 macchanger
+python3
+aria2
 WORLD
 
 rc_add devfs sysinit

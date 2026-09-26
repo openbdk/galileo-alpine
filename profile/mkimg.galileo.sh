@@ -29,6 +29,7 @@ profile_galileo() {
 		net-tools iproute2 iputils traceroute mtr ethtool bind-tools tcpdump nftables
 		tor torsocks cryptsetup macchanger
 		bitcoin bitcoin-cli
+		python3 aria2
 		"
 	apkovl="genapkovl-galileo.sh"
 }

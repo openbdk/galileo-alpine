@@ -1,7 +1,7 @@
 # overlay files vendored from bankonOS (github.com/cryptoAGI/bankonOS)
-bankonos_commit=4a5dacac10ed76b18eda2d161d994ee0716260d2
+bankonos_commit=cc2da1d93cbc6585fab648a2a06e0d31671ac9b1
 bankonos_dirty=no
-synced=2026-09-26T07:23:30Z
+synced=2026-09-26T08:48:04Z
 0fff2c7e3834a158ede0c728347577989cd4d6ea7098d42c03c5d78027f27f7c  etc/default/bankon-amnesia
 3a2c53d6546d0873cc78bee1c36c502b7b8cb95bc70f00676f102c06c4168912  etc/init.d/bankon-amnesia
 534347af183178690eb226b1c1af002d7973a867f89d8fe55a73bbf08432adb6  opt/bankonme/builds/alpine/chomsky.build
@@ -9,5 +9,7 @@ synced=2026-09-26T07:23:30Z
 38deb152e5030a324c235fe574291bd2dbcfbd3ab9bf1ccefa1dc8dc5fd81a38  opt/bankonme/builds/lib/common.sh
 7102e2b436a9be6e5d4013c705cd6f633ecfb28c402841f0e6f346f64553a81b  opt/bankonme/builds/versions.env
 b07e4f9fff33f6a9af9050c5dcfe756c61044863909c5e6d4215f94a905f44da  usr/local/bin/bankon-ram
+6056c55ff18bfa790da498fe62689e9e7c021ce9783f3ffc43570752ef6a63a8  usr/local/bin/bankon-share
+d0cf2c6d988c7f73bf00a4eb65fa90c9baafe635d045758959589ce7fc6fec44  usr/local/bin/thotmap.py
 a961a2b33d79d6174176206ee49533e920e09927b641ea1167ca25e9f05a0082  usr/local/sbin/bankon-amnesia
 f46dec8a4e3fc96fb6bdcdda4de2e7b54c5a1b147e619c87a794cdb775186bdb  usr/local/sbin/openbdk-bootstrap

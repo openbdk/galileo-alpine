@@ -6,6 +6,7 @@
     bankon-ram net           network + Tor checks (sends nothing)
     bankon-ram clock         skew vs chronos, mindX's time oracle (Tor needs a correct clock)
     bankon-amnesia status    is this session amnesic?
+    bankon-share id|seed|get share by THOT / CID: BitTorrent, IPFS, Tor, Arweave (verified)
     openbdk-bootstrap USER   prepare for openbdk/builder (bash, doas, apk cache)
     apk add bitcoin bitcoin-cli                               Bitcoin Core, offline from the ISO
     bash /opt/bankonme/builds/alpine/chomsky.build conf       bitcoin.conf + read-only AION RPC user

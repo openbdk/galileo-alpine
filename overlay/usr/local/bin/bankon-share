@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+# ══════════════════════════════════════════════════════════════════════
+#  bankon-share — file sharing mapped from THOT / CID, immutable where asked
+# ══════════════════════════════════════════════════════════════════════
+#
+#  A file's identity is its THOT reference, thot:<sha256> (THOTpaper §2).
+#  Every way of sharing it is a locator mapped from that identity:
+#
+#    ipfs        CIDv1 (raw ≤ 256 KiB, UnixFS above) — same as `ipfs add --cid-version 1`
+#    bittorrent  v1 infohash, magnet link, .torrent (comment = thot:…, web seeds allowed)
+#    onion       an OnionShare address, when Tor is chosen
+#    arweave     immutable: the bytes on Arweave (~/permanence dapp; CONFIRM=1 to write)
+#    http        any URL serving the same bytes
+#
+#  Whatever the transport, fetched bytes are checked against the identity
+#  before they are kept: sha256 = thot, or CID recomputed. A locator is
+#  evidence; the hash is the identity. Tor is an option for every
+#  transport that can use it, never a requirement.
+#
+#  Usage:
+#    bankon-share id FILE [--webseed URL]... [--tracker URL]...   identities + .torrent, mapped
+#    bankon-share map [THOT]                                      the local THOT → locator map
+#    bankon-share seed FILE [--torrent] [--ipfs] [--tor]          share it (default --torrent)
+#    bankon-share stop [THOT]                                     stop seeding
+#    bankon-share get LOCATOR [--out FILE] [--thot thot:…] [--tor]
+#                     LOCATOR: thot:… | magnet:… | file.torrent | CID | ar://ID | https://…
+#    bankon-share permanent FILE [--mainnet] [--public] [--jwk KEY]   → Arweave (CONFIRM=1 writes)
+#    bankon-share receipt THOT|ARWEAVE_ID                         permanence rung the network proves
+#    bankon-share deps                                            install the transports
+#
+#  Map: $BANKON_SHARE_HOME (default ~/.local/share/bankon-share). On a RAM
+#  build it is in RAM like everything else — keep it in Tomb to persist.
+# ══════════════════════════════════════════════════════════════════════
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+THOTMAP="${THOTMAP:-${HERE}/thotmap.py}"
+SHARE_HOME="${BANKON_SHARE_HOME:-${HOME}/.local/share/bankon-share}"
+MAP="${SHARE_HOME}/map.jsonl"
+PERMANENCE="${PERMANENCE_DIR:-${HOME}/permanence}"
+IPFS_GATEWAY="${IPFS_GATEWAY:-https://ipfs.io}"
+AR_GATEWAY="${AR_GATEWAY:-https://arweave.net}"
+
+B=$'\033[1m' Y=$'\033[1;33m' R=$'\033[0;31m' G=$'\033[0;32m' N=$'\033[0m'
+[[ -t 1 ]] || { B= Y= R= G= N=; }
+kv()   { printf '  %-12s %s\n' "$1" "$2"; }
+say()  { printf '%s[share]%s %s\n' "$B" "$N" "$*"; }
+warn() { printf '%s[warn]%s %s\n' "$Y" "$N" "$*" >&2; }
+die()  { printf '%s[fail]%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+need() { have "$1" || die "$1 not installed (bankon-share deps)"; }
+
+init() {
+    need python3; need jq
+    mkdir -p "${SHARE_HOME}/torrents" "${SHARE_HOME}/run"
+    chmod 700 "${SHARE_HOME}"
+}
+
+# ── map ───────────────────────────────────────────────────────────────
+map_get() { [[ -f "$MAP" ]] && jq -c --arg t "$1" 'select(.thot == $t)' "$MAP" | tail -1; }
+
+# merge fields into the entry for THOT (last line wins; history is kept)
+map_put() {
+    local thot="$1" patch="$2" cur
+    cur=$(map_get "$thot"); [[ -n "$cur" ]] || cur="{}"
+    jq -c -n --argjson a "$cur" --argjson b "$patch" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '$a * $b | .updated = $at
+         | .locators |= with_entries(.value |= unique)' >> "$MAP"
+}
+
+add_locator() {  # thot kind value
+    map_put "$1" "$(jq -n --arg k "$2" --arg v "$3" --argjson cur "$(map_get "$1" | jq '.locators // {}')" \
+        '{locators: ($cur | .[$k] = ((.[$k] // []) + [$v]))}')"
+}
+
+# ── id ────────────────────────────────────────────────────────────────
+cmd_id() {
+    local file="${1:?usage: bankon-share id FILE}"; shift
+    [[ -f "$file" ]] || die "no such file: $file"
+    local args=() name; name=$(basename "$file")
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --webseed|--tracker) args+=("$1" "$2"); shift 2 ;;
+            *) die "unknown option $1" ;;
+        esac
+    done
+    # re-identifying keeps what the map already knows: web seeds and trackers
+    # live outside the torrent's info dict, so dropping them would keep the
+    # infohash but silently lose the sources
+    local known w
+    known=$(map_get "thot:$(sha256sum "$file" | cut -d' ' -f1)")
+    if [[ -n "$known" ]]; then
+        while read -r w; do [[ -n "$w" ]] && args+=(--webseed "$w"); done < <(jq -r '.locators.http[]? // empty' <<<"$known")
+        while read -r w; do [[ -n "$w" ]] && args+=(--tracker "$w"); done < <(jq -r '.trackers[]? // empty' <<<"$known")
+    fi
+    local tmp; tmp=$(mktemp)
+    python3 "$THOTMAP" "$file" --torrent "$tmp" "${args[@]}" > "${tmp}.json" || die "thotmap failed"
+    local j thot btih
+    j=$(cat "${tmp}.json"); thot=$(jq -r .thot <<<"$j"); btih=$(jq -r .btih <<<"$j")
+    mv "$tmp" "${SHARE_HOME}/torrents/${btih}.torrent"; rm -f "${tmp}.json"
+    map_put "$thot" "$(jq -c --arg n "$name" --arg p "$(readlink -f "$file")" --arg tf "${SHARE_HOME}/torrents/${btih}.torrent" \
+        '{thot, sha256, bytes, cid, cid_raw, cid_codec, btih, piece_length, name: $n, path: $p, torrent: $tf,
+          rung: "referenced", trackers: .trackers,
+          locators: {ipfs: [.cid], bittorrent: [.magnet], http: .webseeds}}' <<<"$j")"
+    kv thot "$thot"
+    kv bytes "$(jq -r .bytes <<<"$j")"
+    kv cid "$(jq -r '.cid + " (" + .cid_codec + ")"' <<<"$j")"
+    kv btih "$btih"
+    kv magnet "$(jq -r .magnet <<<"$j")"
+    kv torrent "${SHARE_HOME}/torrents/${btih}.torrent"
+    kv rung "referenced (hash + locators known; nothing stored yet)"
+}
+
+cmd_map() {
+    [[ -f "$MAP" ]] || { say "map is empty"; return; }
+    if [[ -n "${1:-}" ]]; then
+        map_get "$1" | jq .
+    else
+        jq -s -r 'group_by(.thot) | map(.[-1]) | .[]
+            | "\(.thot)  \(.bytes)B  \(.name)  rung:\(.rung)  [\(.locators | keys | join(","))]"' "$MAP"
+    fi
+}
+
+# ── seed ──────────────────────────────────────────────────────────────
+cmd_seed() {
+    local file="${1:?usage: bankon-share seed FILE [--torrent] [--ipfs] [--tor]}"; shift
+    local t=0 i=0 o=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in --torrent) t=1 ;; --ipfs) i=1 ;; --tor) o=1 ;; *) die "unknown option $1" ;; esac; shift
+    done
+    (( t + i + o )) || t=1
+    cmd_id "$file" >/dev/null
+    local e thot; thot="thot:$(sha256sum "$file" | cut -d' ' -f1)"; e=$(map_get "$thot")
+
+    if (( t )); then
+        need aria2c
+        local tf btih; tf=$(jq -r .torrent <<<"$e"); btih=$(jq -r .btih <<<"$e")
+        # -V checks the local file against the pieces before seeding it
+        aria2c -D -V --seed-ratio=0.0 --dir="$(dirname "$(readlink -f "$file")")" \
+            --enable-dht=true --bt-enable-lpd=true --enable-peer-exchange=true \
+            --log="${SHARE_HOME}/run/${btih}.log" --log-level=notice "$tf" \
+            && say "BitTorrent: seeding ${btih} (DHT, no tracker unless the .torrent has one)"
+        warn "BitTorrent announces this machine's IP to peers; it is not routed through Tor"
+    fi
+    if (( i )); then
+        need ipfs
+        local got want; want=$(jq -r .cid <<<"$e")
+        got=$(ipfs add -Q --cid-version 1 --pin "$file") || die "ipfs add failed (daemon or repo?)"
+        [[ "$got" == "$want" ]] || die "IPFS returned ${got}, the map says ${want} — not recording it"
+        add_locator "$thot" ipfs "$got"
+        say "IPFS: pinned ${got}"
+    fi
+    if (( o )); then
+        have onionshare-cli || die "onionshare-cli not installed (Debian: apt install onionshare-cli)"
+        say "Tor: starting OnionShare for $(basename "$file") — the onion address prints below; Ctrl-C stops it"
+        onionshare-cli --persistent "${SHARE_HOME}/run/onionshare-$(jq -r .btih <<<"$e").json" "$file"
+    fi
+}
+
+cmd_stop() {
+    local b
+    if [[ -n "${1:-}" ]]; then b=$(map_get "$1" | jq -r .btih); pkill -f "aria2c.*${b}.torrent" && say "stopped ${b}"
+    else pkill -f "aria2c.*${SHARE_HOME}/torrents/" && say "stopped all seeding"; fi
+}
+
+# ── get + verify ──────────────────────────────────────────────────────
+verify_file() {  # file expected_thot expected_cid
+    local f="$1" want_thot="${2:-}" want_cid="${3:-}" j
+    j=$(python3 "$THOTMAP" "$f") || return 1
+    if [[ -n "$want_thot" && "$(jq -r .thot <<<"$j")" != "$want_thot" ]]; then
+        warn "sha256 does not match ${want_thot}"; return 1
+    fi
+    if [[ -n "$want_cid" && "$(jq -r .cid <<<"$j")" != "$want_cid" && "$(jq -r .cid_raw <<<"$j")" != "$want_cid" ]]; then
+        warn "CID does not match ${want_cid}"; return 1
+    fi
+    echo "$j"
+}
+
+http_get() {  # url out tor
+    local via=(); [[ "$3" == 1 ]] && { need torsocks; via=(torsocks); }
+    "${via[@]}" curl -fL --retry 2 --max-time 600 -o "$2" "$1"
+}
+
+cmd_get() {
+    local loc="${1:?usage: bankon-share get LOCATOR [--out FILE] [--thot thot:…] [--tor]}"; shift
+    local out="" want_thot="" tor=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in --out) out="$2"; shift 2 ;; --thot) want_thot="$2"; shift 2 ;; --tor) tor=1; shift ;; *) die "unknown option $1" ;; esac
+    done
+    local want_cid="" e
+    if [[ "$loc" == thot:* ]]; then
+        want_thot="$loc"; e=$(map_get "$loc")
+        [[ -n "$e" ]] || die "${loc} is not in the map — give a magnet, CID or ar:// locator with --thot ${loc}"
+        want_cid=$(jq -r .cid <<<"$e")
+        # prefer the immutable copy, then IPFS, then BitTorrent
+        loc=$(jq -r '(.locators.arweave // [] | map("ar://" + .)) + (.locators.ipfs // []) + (.locators.bittorrent // []) | first // empty' <<<"$e")
+        [[ -n "$loc" ]] || die "no locator for ${want_thot}"
+        say "resolving ${want_thot} → ${loc}"
+    fi
+    local tmp; tmp=$(mktemp -d)
+    case "$loc" in
+        *.torrent)
+            need aria2c
+            [[ -f "$loc" ]] || die "no such .torrent: $loc"
+            aria2c -q --seed-time=0 --bt-stop-timeout=300 --dir="$tmp" "$loc" || die "BitTorrent fetch failed"
+            ;;
+        magnet:*)
+            need aria2c
+            (( tor )) && warn "BitTorrent does not go through Tor; fetching directly"
+            aria2c -q --seed-time=0 --bt-stop-timeout=300 --dir="$tmp" --bt-save-metadata=false "$loc" || die "BitTorrent fetch failed"
+            ;;
+        http://*|https://*) http_get "$loc" "$tmp/data" "$tor" || die "HTTP fetch failed" ;;
+        ar://*)
+            http_get "${AR_GATEWAY}/${loc#ar://}" "$tmp/data" "$tor" || die "Arweave fetch failed" ;;
+        *)
+            if [[ "$loc" =~ ^(baf[a-z2-7]{50,}|Qm[1-9A-HJ-NP-Za-km-z]{44})$ ]]; then
+                want_cid="${want_cid:-$loc}"
+                # the local node first (it may hold the blocks with no peers at all), then a gateway
+                if ! { have ipfs && timeout 120 ipfs get -o "$tmp/data" "$loc" >/dev/null 2>&1; }; then
+                    rm -rf "$tmp/data"
+                    http_get "${IPFS_GATEWAY}/ipfs/${loc}" "$tmp/data" "$tor" || die "IPFS fetch failed (local node and ${IPFS_GATEWAY})"
+                fi
+            elif [[ "$loc" =~ ^[A-Za-z0-9_-]{43}$ ]]; then
+                http_get "${AR_GATEWAY}/${loc}" "$tmp/data" "$tor" || die "Arweave fetch failed"
+            else
+                die "unrecognised locator: $loc"
+            fi ;;
+    esac
+    local f; f=$(find "$tmp" -type f ! -name '*.aria2' | head -1)
+    [[ -f "$f" ]] || die "nothing was downloaded"
+    local j
+    if ! j=$(verify_file "$f" "$want_thot" "$want_cid"); then
+        rm -rf "$tmp"; die "VERIFICATION FAILED — the bytes are not the ones asked for; nothing kept"
+    fi
+    local empty='{}'
+    out="${out:-$(jq -r '.name // empty' <<<"${e:-$empty}")}"; out="${out:-$(basename "$f")}"
+    mv "$f" "$out"; rm -rf "$tmp"
+    printf '%s[ ok ]%s %s  %s\n' "$G" "$N" "$out" "$(jq -r .thot <<<"$j")"
+    [[ -n "$want_thot$want_cid" ]] && say "verified against $([[ -n $want_thot ]] && echo "$want_thot")$([[ -n $want_cid ]] && echo " ${want_cid}")" \
+        || warn "no THOT or CID given — hashed, but not verified against an expected identity"
+}
+
+# ── immutable (Arweave via ~/permanence) ─────────────────────────────
+cmd_permanent() {
+    local file="${1:?usage: bankon-share permanent FILE [--mainnet] [--public] [--jwk KEY]}"; shift
+    local net=sandbox pub=0 jwk="${ARWEAVE_JWK:-}"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in --mainnet) net=mainnet; shift ;; --public) pub=1; shift ;; --jwk) jwk="$2"; shift 2 ;; *) die "unknown option $1" ;; esac
+    done
+    [[ -f "${PERMANENCE}/dapp.mjs" ]] || die "the permanence dapp is not at ${PERMANENCE} (PERMANENCE_DIR)"
+    need node
+    cmd_id "$file" >/dev/null
+    file="$(readlink -f "$file")"   # absolute before any cd into the dapp
+    local thot; thot="thot:$(sha256sum "$file" | cut -d' ' -f1)"
+    local netarg=(); [[ "$net" == sandbox ]] && netarg=(--net sandbox)
+    say "quote (${net}):"
+    (cd "$PERMANENCE" && node dapp.mjs quote "$file" --rung stored "${netarg[@]}") | sed 's/^/  /'
+    local cmd=(node dapp.mjs put "$file" --rung stored "${netarg[@]}" --tag "THOT-Ref=${thot}" --tag "App-Name=bankonOS")
+    (( pub )) && cmd+=(--no-encrypt)
+    if [[ "${CONFIRM:-0}" != 1 ]]; then
+        say "dry run — to write, set CONFIRM=1 (and --jwk KEY):"
+        echo "  cd ${PERMANENCE} && CONFIRM=1 ${cmd[*]} --jwk <key.json>"
+        (( pub )) || warn "encrypted by default: the stored bytes (and their CID) differ from the file; --public stores them as-is"
+        return 0
+    fi
+    [[ -n "$jwk" && -f "$jwk" ]] || die "CONFIRM=1 needs --jwk KEY (or ARWEAVE_JWK); the key never leaves this machine"
+    local res id
+    res=$(cd "$PERMANENCE" && "${cmd[@]}" --jwk "$jwk") || die "dapp put failed"
+    echo "$res" | sed 's/^/  /'
+    id=$(grep -oE '\b[A-Za-z0-9_-]{43}\b' <<<"$res" | head -1)
+    [[ -n "$id" ]] || die "no Arweave id in the dapp's reply — check it by hand"
+    add_locator "$thot" arweave "$id"
+    say "recorded ${id}; the rung rises to stored only when the network proves it: bankon-share receipt ${thot}"
+}
+
+cmd_receipt() {
+    local ref="${1:?usage: bankon-share receipt THOT|ARWEAVE_ID}" id="$ref" e
+    if [[ "$ref" == thot:* ]]; then
+        e=$(map_get "$ref"); id=$(jq -r '.locators.arweave // [] | last // empty' <<<"$e")
+        [[ -n "$id" ]] || die "${ref} has no Arweave locator yet"
+    fi
+    need node
+    local r; r=$(cd "$PERMANENCE" && node dapp.mjs receipt "$id") || die "receipt failed"
+    echo "$r" | sed 's/^/  /'
+    local rung; rung=$(jq -r '.rung // empty' <<<"$r" 2>/dev/null)
+    if [[ -n "$rung" && "$ref" == thot:* ]]; then map_put "$ref" "$(jq -n --arg r "$rung" '{rung: $r}')"; say "rung: ${rung}"; fi
+}
+
+cmd_deps() {
+    [[ $EUID -eq 0 ]] || die "deps needs root"
+    if [[ -f /etc/alpine-release ]]; then
+        apk add -q python3 jq aria2 curl torsocks
+        say "OnionShare is not packaged for Alpine; --tor seeding is Debian/Devuan only"
+    else
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends python3 jq aria2 curl torsocks onionshare-cli
+    fi
+    have ipfs || say "IPFS: install kubo with jung.install ipfs (pinned, verified, as a service)"
+    say "transports ready"
+}
+
+usage() { sed -n '21,32p' "$0" | sed 's/^#  \{0,1\}//'; }
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in deps|help|-h|--help) ;; *) init ;; esac
+case "$cmd" in
+    id)        cmd_id "$@" ;;
+    map)       cmd_map "$@" ;;
+    seed)      cmd_seed "$@" ;;
+    stop)      cmd_stop "$@" ;;
+    get)       cmd_get "$@" ;;
+    permanent) cmd_permanent "$@" ;;
+    receipt)   cmd_receipt "$@" ;;
+    deps)      cmd_deps ;;
+    help|-h|--help) usage ;;
+    *) usage; exit 2 ;;
+esac
