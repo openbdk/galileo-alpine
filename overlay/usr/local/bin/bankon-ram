@@ -21,6 +21,7 @@
 #    bankon-ram bench [SECONDS]              CPU + memory throughput
 #    bankon-ram net                          local network diagnostics (no probes)
 #    bankon-ram net-probe HOST               ping/traceroute/mtr to HOST (sends traffic)
+#    bankon-ram clock [--set]                skew vs chronos promised time (sends traffic; via Tor if running)
 #    bankon-ram shred PATH...                overwrite then delete files (GNU shred)
 #    bankon-ram wipe-ram                     shred RAM vault, reset zram, drop caches, sdmem
 #    bankon-ram wipe-device /dev/X           erase a whole device (asks to confirm)
@@ -315,6 +316,55 @@ cmd_net_probe() {
     elif have traceroute; then hdr "traceroute $host"; traceroute -w 2 "$host" 2>&1 | sed 's/^/  /'; fi
 }
 
+# ── clock: chronos promised time (mindX chronos.oracle) ──────────────
+# Tor refuses a skewed clock, and a RAM system boots with only the hardware
+# clock. chronos (mindX) publishes a promised time — unix at 18 dp, with a
+# consensus state and a confidence interval. This measures the local skew
+# against it; the local side is only as precise as its clock source says.
+readonly CHRONOS_URL="${CHRONOS_URL:-https://mindx.pythai.net/v1/oracle/time}"
+
+local_unix() {  # prints "<unix seconds with fraction> <resolution>"
+    local n; n=$(date +%s.%N 2>/dev/null)
+    if [[ "$n" =~ ^[0-9]+\.[0-9]{9}$ ]]; then echo "$n 1ns"; else echo "$(date +%s) 1s"; fi
+}
+
+cmd_clock() {
+    local set=0; [[ "${1:-}" == "--set" ]] && set=1
+    have curl || die "curl required"
+    have jq || die "jq required"
+    local via=() how="direct"
+    if running tor && have torsocks; then via=(torsocks); how="via Tor"; fi
+    warn "asking chronos (${CHRONOS_URL}) ${how}"
+    local t0 t1 res body
+    read -r t0 res < <(local_unix)
+    body=$("${via[@]}" curl -sf --max-time 20 "$CHRONOS_URL") || die "chronos unreachable ${how}"
+    read -r t1 _ < <(local_unix)
+    local promised consensus conf utc
+    promised=$(jq -r .unix_18dp <<<"$body"); consensus=$(jq -r .consensus <<<"$body")
+    conf=$(jq -r .confidence_ms <<<"$body"); utc=$(jq -r .utc <<<"$body")
+    [[ "$promised" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "chronos reply has no unix_18dp"
+    # compare against the midpoint of the request; the round trip bounds the error
+    local skew rtt
+    skew=$(awk -v p="$promised" -v a="$t0" -v b="$t1" 'BEGIN { printf "%.3f", ((a + b) / 2 - p) * 1000 }')
+    rtt=$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.0f", (b - a) * 1000 }')
+    hdr "clock vs chronos"
+    kv "chronos" "$utc ($consensus, ±${conf%.*} ms)"
+    kv "local" "$(date -u '+%Y-%m-%dT%H:%M:%SZ') (resolution $res)"
+    if [[ "$res" == 1s ]]; then
+        # a 1 s clock cannot state milliseconds: report whole seconds only
+        kv "skew" "$(awk -v s="$skew" 'BEGIN { printf "%+d", (s < 0 ? -int(-s / 1000 + 0.5) : int(s / 1000 + 0.5)) }') s  (local clock reads whole seconds; round trip ${rtt} ms)"
+    else
+        kv "skew" "${skew} ms  (local minus chronos; round trip ${rtt} ms bounds it)"
+    fi
+    if (( set )); then
+        root "clock --set"
+        [[ "$consensus" == correlated ]] || die "chronos consensus is '$consensus' — not setting the clock from it"
+        awk -v s="$skew" 'BEGIN { exit !(s > 2000 || s < -2000) }' || { kv "set" "within 2 s — left alone"; return 0; }
+        date -u -s "@${promised%%.*}" >/dev/null && kv "set" "clock set to chronos (${promised%%.*})"
+        have hwclock && hwclock -w 2>/dev/null || true
+    fi
+}
+
 # ── wiping ───────────────────────────────────────────────────────────
 # GNU shred overwrites in place. That works on tmpfs (RAM) and plain
 # magnetic disks. On flash (USB, SSD) wear-levelling moves blocks, and on
@@ -395,7 +445,7 @@ cmd_report() {
     echo "$f"
 }
 
-usage() { sed -n '18,31p' "$0" | sed 's/^#  \{0,1\}//'; }
+usage() { sed -n '18,32p' "$0" | sed 's/^#  \{0,1\}//'; }
 
 cmd="${1:-status}"; shift || true
 case "$cmd" in
@@ -407,6 +457,7 @@ case "$cmd" in
     bench)         cmd_bench "$@" ;;
     net)           cmd_net ;;
     net-probe)     cmd_net_probe "$@" ;;
+    clock)         cmd_clock "$@" ;;
     shred)         cmd_shred "$@" ;;
     wipe-ram)      cmd_wipe_ram ;;
     wipe-device)   cmd_wipe_device "$@" ;;

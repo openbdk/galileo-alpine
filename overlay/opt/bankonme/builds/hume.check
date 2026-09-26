@@ -32,9 +32,19 @@ probe() {
 snapshot() {
     local out="${1:-${HUME_DIR}/$(hostname)-$(date +%Y%m%dT%H%M%S).json}"
     mkdir -p "$(dirname "${out}")"
-    python3 - "${out}" "$(probe getblockcount)" "$(probe getnewaddress)" "$(probe sendtoaddress)" "$(probe stop)" <<'PY'
+    # promised time from chronos (mindX): every verifiable artefact is stamped
+    # with it (Chronos.agent contract). Via Tor when tor runs; null if unreachable.
+    local chronos="" via=()
+    command -v torsocks >/dev/null && pgrep -x tor >/dev/null 2>&1 && via=(torsocks)
+    chronos=$("${via[@]}" curl -sf --max-time 15 "${CHRONOS_URL:-https://mindx.pythai.net/v1/oracle/time}" 2>/dev/null || true)
+    python3 - "${out}" "$(probe getblockcount)" "$(probe getnewaddress)" "$(probe sendtoaddress)" "$(probe stop)" "${chronos}" <<'PY'
 import hashlib, json, os, platform, shutil, subprocess, sys, time
-out, read, newaddr, send, stop = sys.argv[1:]
+out, read, newaddr, send, stop, chronos_raw = sys.argv[1:]
+try:
+    c = json.loads(chronos_raw) if chronos_raw else None
+    chronos = {k: c[k] for k in ("unix_18dp", "utc", "consensus", "confidence_ms")} if c else None
+except (ValueError, KeyError, TypeError):
+    chronos = None
 
 def ver(tool):
     path = shutil.which(tool)
@@ -68,6 +78,7 @@ held = read == "200" and all(v == "403" for k, v in boundary.items() if not k.st
 
 record = {
     "observed_at": int(time.time()),
+    "chronos": chronos,
     "host": platform.node(), "arch": platform.machine(),
     "os": f"{os_release.get('ID', '?')} {os_release.get('VERSION_ID', '?')}",
     "tools": {t: ver(t) for t in ("bitcoind", "bitcoin-cli", "forge", "cast", "anvil", "chisel", "python3")},
@@ -100,7 +111,7 @@ def flat(d, pre=""):
 fa, fb = dict(flat(a)), dict(flat(b))
 changed = 0
 for k in sorted(set(fa) | set(fb)):
-    if k == "observed_at" or fa.get(k) == fb.get(k):
+    if k == "observed_at" or k.startswith("chronos.") or fa.get(k) == fb.get(k):
         continue
     changed += 1
     print(f"{k}\n  - {fa.get(k)}\n  + {fb.get(k)}")
